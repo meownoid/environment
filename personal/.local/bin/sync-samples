@@ -1,0 +1,14 @@
+#!/usr/bin/env sh
+# Synchronize sample library into a mounted volume under /Volumes.
+# Usage: sync-samples [dest-volume-name]
+
+SRC="${HOME}/Music/Samples"
+DEST_VOLUME="${1:-SP404}"
+DST="/Volumes/${DEST_VOLUME}/"
+
+if [ ! -d "${DST}" ]; then
+    echo "Destination ${DST} is not mounted"
+    exit 1
+fi
+
+rsync -rtuhv --modify-window=1 --exclude '.DS_Store' --exclude '*.asd' --progress --delete --delete-excluded "$SRC" "$DST"

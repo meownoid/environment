@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+
+"""Run a command for every file matching a glob pattern.
+
+`fch` expands the supplied glob, optionally replaces `@` placeholders in the
+command with the current filename, and executes the command for each match in
+sorted order.
+
+Examples:
+    fch "*.py" black @
+    fch "src/**/*.json" jq '.' @
+"""
+
+import glob
+import os
+import subprocess
+import sys
+
+
+def usage(name: str) -> None:
+    print(f"Usage: {name} PATTERN COMMAND [ARGS...]", file=sys.stderr)
+    sys.exit(1)
+
+
+def expand_arg(template: str, filename: str) -> tuple[str, bool]:
+    """Expand @ placeholders in template with the given filename."""
+    parts: list[str] = []
+    used_placeholder = False
+    i = 0
+    length = len(template)
+    while i < length:
+        char = template[i]
+        if char == "@":
+            if i + 1 < length and template[i + 1] == "@":
+                parts.append("@")
+                i += 2
+            else:
+                parts.append(filename)
+                used_placeholder = True
+                i += 1
+        else:
+            parts.append(char)
+            i += 1
+    return "".join(parts), used_placeholder
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        usage(argv[0])
+
+    pattern = os.path.expanduser(argv[1])
+    command_template = argv[2:]
+
+    matches = sorted(glob.glob(pattern, recursive=True))
+    if not matches:
+        print(f"{argv[0]}: no files match pattern '{argv[1]}'", file=sys.stderr)
+        return 1
+
+    last_returncode = 0
+    for filename in matches:
+        expanded: list[str] = []
+        used_placeholder = False
+        for arg in command_template:
+            transformed, used = expand_arg(arg, filename)
+            expanded.append(transformed)
+            used_placeholder = used_placeholder or used
+
+        if not used_placeholder:
+            expanded.append(filename)
+
+        try:
+            result = subprocess.run(expanded, check=False)
+        except FileNotFoundError:
+            print(f"{argv[0]}: command not found: {expanded[0]}", file=sys.stderr)
+            return 127
+
+        if result.returncode != 0:
+            last_returncode = result.returncode
+
+    return last_returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+
+"""CLI for transcoding videos into an Apple-friendly H.264 MP4.
+
+Example:
+    transcode input.mov --resolution 4k --force output.mp4
+"""
+
+import argparse
+import sys
+import os
+import subprocess
+
+SCALE_FILTERS = {
+    "1080": "scale=-2:1080",
+    "720": "scale=-2:720",
+    "4k": "scale=-2:2160",
+}
+
+
+def transcode_for_apple(input_path, output_path, scale_filter):
+    # This is the ffmpeg command.
+    # -i: input file
+    # -c:v libx264: Use the H.264 video codec, which is widely supported.
+    # -c:a aac: Use AAC for Apple compatibility.
+    # -b:a 320k: Request the highest practical AAC bitrate for high quality output.
+    # -profile:a aac_low: Use the AAC-LC profile for broad device support.
+    # -vf scale=-2:<height>: Force the requested output height while keeping the aspect ratio.
+    # -pix_fmt yuv420p: Sets the pixel format for broad compatibility.
+    # -movflags +faststart: Moves metadata to the start of the file,
+    #                       which helps the video start playing faster when streamed.
+    # -y: Overwrite output file if it exists (though we check for this already).
+    command = [
+        "ffmpeg",
+        "-i",
+        input_path,
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "320k",
+        "-profile:a",
+        "aac_low",
+        "-vf",
+        scale_filter,
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        "-y",
+        output_path,
+    ]
+
+    try:
+        subprocess.run(command, check=True)
+        print(f"Successfully transcoded to '{output_path}'")
+    except subprocess.CalledProcessError as e:
+        print(f"Error during transcoding '{input_path}':")
+        print(e.stderr.decode())
+    except FileNotFoundError:
+        print("Error: 'ffmpeg' command not found.")
+        print("Please make sure ffmpeg is installed and in your system's PATH.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Transcode a video for Apple devices.")
+    parser.add_argument("input_path", help="Path to the source video file")
+    parser.add_argument(
+        "output_path",
+        nargs="?",
+        help="Optional output file path (defaults to <input_basename>.mp4)",
+    )
+    parser.add_argument(
+        "-r",
+        "--resolution",
+        choices=tuple(SCALE_FILTERS.keys()),
+        default="1080",
+        help="Output resolution (default: 1080)",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Overwrite the output file if it already exists",
+    )
+
+    args = parser.parse_args()
+
+    input_file = args.input_path
+
+    # Check if the input file exists.
+    if not os.path.exists(input_file):
+        print(f"Error: '{input_file}' not found")
+        sys.exit(1)
+
+    # Determine the output file path.
+    output_file = args.output_path
+    if output_file is None:
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        output_file = f"{base_name}.mp4"
+
+    if os.path.exists(output_file):
+        if args.force:
+            print(f"Output file '{output_file}' exists and will be overwritten.")
+        else:
+            print(f"Output file '{output_file}' already exists. Skipping.")
+            sys.exit(1)
+
+    print(f"Transcoding '{input_file}'...")
+    transcode_for_apple(input_file, output_file, SCALE_FILTERS[args.resolution])

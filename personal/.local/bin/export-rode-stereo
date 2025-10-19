@@ -1,0 +1,411 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#   "numpy==2.3.2",
+#   "soundfile==0.13.1",
+# ]
+# ///
+
+"""
+Locate recent Rode Wireless PRO mono recordings and export them as combined
+stereo files or separate channel copies in the local Music/Recordings folder.
+
+Examples:
+    Merge the newest recording into a stereo WAV:
+        export-rode-stereo --merge
+
+    Pick a recording interactively and overwrite existing output:
+        export-rode-stereo --interactive --force
+"""
+
+import argparse
+import numpy as np
+import soundfile as sf
+import re
+from pathlib import Path
+import sys
+from datetime import datetime
+import shutil
+
+
+def find_all_recordings(base_search_paths, time_window=5):
+    """
+    Scans specified base paths for directories starting with 'WirelessPRO'
+    and finds pairs of left/right WAV files based on creation time.
+
+    A left and right file are considered a pair if their creation timestamps
+    are within N seconds of each other.
+
+    Args:
+        base_search_paths (list): A list of Path objects to search in.
+        time_window (int): The maximum time difference in seconds to consider
+                           two files as a pair. Default is 5 seconds.
+
+    Returns:
+        list: A list of dictionaries, where each dictionary represents a
+              matched pair. e.g.,
+              [{'left': Path(...), 'right': Path(...), 'timestamp': ..., 'rec_num': ...}]
+    """
+    file_pattern = re.compile(r"(\d+)_TX(1LEFT|2RIGHT)\.WAV", re.IGNORECASE)
+
+    left_files = []
+    right_files = []
+
+    found_any_pro_dirs = False
+    for base_path in base_search_paths:
+        for pro_dir in base_path.glob("WirelessPRO*"):
+            if not pro_dir.is_dir():
+                continue
+
+            found_any_pro_dirs = True
+
+            for wav_file in pro_dir.rglob("*.WAV"):
+                match = file_pattern.search(wav_file.name)
+
+                if not match:
+                    continue
+
+                rec_num = int(match.group(1))
+                channel_info = match.group(2).upper()
+
+                try:
+                    timestamp = wav_file.stat().st_ctime
+                    file_info = {
+                        "path": wav_file,
+                        "timestamp": timestamp,
+                        "num": rec_num,
+                    }
+                    if channel_info == "1LEFT":
+                        left_files.append(file_info)
+                    elif channel_info == "2RIGHT":
+                        right_files.append(file_info)
+                except FileNotFoundError:
+                    # File might have been deleted during scan
+                    continue
+
+    if not found_any_pro_dirs:
+        print(
+            "Warning: No directories starting with 'WirelessPRO' found.",
+            file=sys.stderr,
+        )
+
+    # Sort both lists by timestamp to enable efficient pairing
+    left_files.sort(key=lambda x: x["timestamp"])
+    right_files.sort(key=lambda x: x["timestamp"])
+
+    pairs = []
+    l_idx, r_idx = 0, 0
+
+    # Use a two-pointer algorithm to find pairs within the time window
+    while l_idx < len(left_files) and r_idx < len(right_files):
+        left = left_files[l_idx]
+        right = right_files[r_idx]
+
+        time_diff = left["timestamp"] - right["timestamp"]
+
+        if abs(time_diff) <= time_window:
+            # Found a pair
+            pairs.append(
+                {
+                    "left": left["path"],
+                    "right": right["path"],
+                    "timestamp": left["timestamp"],  # Use left's timestamp as canonical
+                    "rec_num": left["num"],  # Use left's number for output filename
+                    "right_num": right["num"],
+                }
+            )
+            l_idx += 1
+            r_idx += 1
+        elif time_diff > time_window:
+            # Left is much newer than right; right is too old, move to the next right
+            r_idx += 1
+        else:  # time_diff < -time_window
+            # Left is much older than right; left is too old, move to the next left
+            l_idx += 1
+
+    return pairs
+
+
+def align_channels_by_correlation(
+    left_data: np.ndarray,
+    right_data: np.ndarray,
+    samplerate: int,
+    align_seconds: float = 10.0,
+    pad_value: float = 0.0,
+):
+    """
+    Align two mono signals via cross-correlation on the first N seconds.
+
+    Returns a tuple: (aligned_left, aligned_right, lag_samples)
+
+    Notes:
+    - Positive lag means 'left' lags 'right' -> pad left at the start.
+    - Negative lag means 'right' lags 'left' -> pad right at the start.
+    - Inputs are expected as 2D arrays (frames, 1); function will coerce if needed.
+    """
+    # Normalize to 2D to be robust
+    if left_data.ndim != 2:
+        left_data = np.atleast_2d(left_data)
+    if right_data.ndim != 2:
+        right_data = np.atleast_2d(right_data)
+
+    if not align_seconds or align_seconds <= 0:
+        return left_data, right_data, 0
+
+    # Flatten to 1D for correlation
+    left_1d = left_data[:, 0]
+    right_1d = right_data[:, 0]
+
+    max_samples = int(align_seconds * samplerate)
+    n = min(left_1d.shape[0], right_1d.shape[0], max_samples)
+
+    if n <= 1:
+        return left_data, right_data, 0
+
+    la = left_1d[:n].astype(np.float32)
+    ra = right_1d[:n].astype(np.float32)
+
+    # Remove DC and normalize to unit variance to improve correlation
+    eps = 1e-8
+    la = (la - la.mean()) / (la.std() + eps)
+    ra = (ra - ra.mean()) / (ra.std() + eps)
+
+    # Full cross-correlation; lag = idx - (n - 1)
+    corr = np.correlate(la, ra, mode="full")
+    lag = int(np.argmax(corr) - (n - 1))
+
+    # Apply leading padding according to lag
+    if lag > 0:
+        left_data = np.pad(
+            left_data, ((lag, 0), (0, 0)), mode="constant", constant_values=pad_value
+        )
+    elif lag < 0:
+        right_data = np.pad(
+            right_data, ((-lag, 0), (0, 0)), mode="constant", constant_values=pad_value
+        )
+
+    return left_data, right_data, lag
+
+
+def sync_mono_signals(
+    left_data: np.ndarray,
+    right_data: np.ndarray,
+    samplerate: int,
+    align_seconds: float = 10.0,
+    pad_value: float = 0.0,
+) -> np.ndarray:
+    """
+    Align two mono signals using cross-correlation on the first N seconds, then
+    return a stereo array shaped (frames, 2). If align_seconds is 0, no
+    alignment is performed; the shorter signal is padded at the end.
+
+    Inputs are expected to be 2D arrays with shape (frames, 1).
+    """
+    # Normalize to 2D just in case
+    if left_data.ndim != 2:
+        left_data = np.atleast_2d(left_data)
+    if right_data.ndim != 2:
+        right_data = np.atleast_2d(right_data)
+
+    # Optionally align using cross-correlation on the first N seconds
+    if align_seconds > 0.0:
+        left_data, right_data, _ = align_channels_by_correlation(
+            left_data,
+            right_data,
+            samplerate,
+            align_seconds=align_seconds,
+            pad_value=pad_value,
+        )
+
+    # Ensure both channels have the same final length by padding the end
+    if left_data.shape[0] != right_data.shape[0]:
+        max_len = max(left_data.shape[0], right_data.shape[0])
+        if left_data.shape[0] < max_len:
+            left_data = np.pad(
+                left_data,
+                ((0, max_len - left_data.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=pad_value,
+            )
+        if right_data.shape[0] < max_len:
+            right_data = np.pad(
+                right_data,
+                ((0, max_len - right_data.shape[0]), (0, 0)),
+                mode="constant",
+                constant_values=pad_value,
+            )
+
+    return np.hstack((left_data, right_data))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Export recordings from WirelessPRO devices.\n"
+            "- Default: copy and rename original mono files.\n"
+            "- Use -m/--merge to combine left/right mono into a single stereo file."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="Display a list of available recordings and choose one interactively.",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Overwrite the output file(s) if they already exist.",
+    )
+    parser.add_argument(
+        "-m",
+        "--merge",
+        action="store_true",
+        help=(
+            "Merge left and right mono WAV files into a single stereo file. "
+            "If not set, the original mono files are copied and renamed."
+        ),
+    )
+    parser.add_argument(
+        "-a",
+        "--align-seconds",
+        type=float,
+        default=15.0,
+        help=(
+            "Seconds from the start to use for cross-correlation alignment (default: 20). "
+            "Set to 0 to disable alignment."
+        ),
+    )
+    args = parser.parse_args()
+
+    complete_recordings = find_all_recordings([Path("/Volumes")])
+
+    if not complete_recordings:
+        print(
+            "Error: No complete recording pairs found within a 60-second window.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Sort by timestamp, descending (newest first)
+    sorted_recordings = sorted(
+        complete_recordings, key=lambda item: item["timestamp"], reverse=True
+    )
+
+    target_data = None
+
+    if args.interactive:
+        print("\nAvailable recordings (newest first):")
+        for i, data in enumerate(sorted_recordings):
+            ts = datetime.fromtimestamp(data["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+            left_num = data["rec_num"]
+            right_num = data["right_num"]
+
+            if left_num == right_num:
+                rec_info = f"REC {left_num:05d}"
+            else:
+                rec_info = f"L: {left_num:05d}, R: {right_num:05d}"
+
+            print(f"  [{i + 1}] {rec_info} ({ts})")
+
+        while True:
+            try:
+                choice = input(
+                    f"\nEnter number to process [1-{len(sorted_recordings)}]: "
+                )
+                choice_idx = int(choice) - 1
+                if 0 <= choice_idx < len(sorted_recordings):
+                    target_data = sorted_recordings[choice_idx]
+                    break
+                else:
+                    print(
+                        f"Invalid choice. Please enter a number between 1 and {len(sorted_recordings)}.",
+                        file=sys.stderr,
+                    )
+            except ValueError:
+                print("Invalid input. Please enter a number.", file=sys.stderr)
+            except (KeyboardInterrupt, EOFError):
+                print("\nOperation cancelled.")
+                sys.exit(0)
+    else:
+        # Default behavior: use the latest recording
+        target_data = sorted_recordings[0]
+
+    ts = datetime.fromtimestamp(target_data["timestamp"]).strftime("%Y%m%dT%H%M%S")
+    ts_readable = datetime.fromtimestamp(target_data["timestamp"]).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    print(f"\nProcessing latest recording from {ts_readable}")
+
+    target_n = target_data["rec_num"]
+    left_file = target_data["left"]
+    right_file = target_data["right"]
+
+    output_dir = Path.home() / "Music" / "Recordings"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Handle output naming and existence checks based on mode
+    if args.merge:
+        output_file = output_dir / f"WirelessPRO_{target_n:05d}_{ts}.wav"
+        if output_file.exists():
+            if args.force:
+                print(f"Overwriting existing file: {output_file}")
+            else:
+                print(
+                    f"Error: Output file already exists: {output_file}. Use -f/--force to overwrite.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        print(f"Combining:\n  L: {left_file.name}\n  R: {right_file.name}")
+
+        left_data, samplerate_l = sf.read(left_file, dtype="float32", always_2d=True)
+        right_data, samplerate_r = sf.read(right_file, dtype="float32", always_2d=True)
+
+        if samplerate_l != samplerate_r:
+            print(
+                f"Error: Sample rate mismatch! Left is {samplerate_l}Hz, Right is {samplerate_r}Hz.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if left_data.shape[0] != right_data.shape[0]:
+            print(
+                "Warning: Channel lengths differ. Padding shorter channel with silence.",
+                file=sys.stderr,
+            )
+
+        stereo_data = sync_mono_signals(
+            left_data, right_data, samplerate_l, align_seconds=args.align_seconds
+        )
+
+        sf.write(output_file, stereo_data, samplerate_l, subtype="FLOAT")
+
+        print(f"Successfully created: {output_file}")
+    else:
+        left_output_file = output_dir / f"WirelessPRO_{target_n:05d}_{ts}_L.wav"
+        right_output_file = output_dir / f"WirelessPRO_{target_n:05d}_{ts}_R.wav"
+        existing = [p for p in (left_output_file, right_output_file) if p.exists()]
+        if existing and not args.force:
+            print(
+                "Error: Output file(s) already exist: "
+                + ", ".join(str(p) for p in existing)
+                + ". Use -f/--force to overwrite.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if existing and args.force:
+            print(
+                "Overwriting existing file(s): " + ", ".join(str(p) for p in existing)
+            )
+
+        shutil.copy2(left_file, left_output_file)
+        shutil.copy2(right_file, right_output_file)
+        print(f"Successfully created: {left_output_file}")
+        print(f"Successfully created: {right_output_file}")
+
+
+if __name__ == "__main__":
+    main()

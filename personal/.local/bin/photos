@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+
+"""Convenience commands for managing photo imports and derivatives.
+
+All subfolders are created under ~/Pictures.
+
+- photos contacts:  gather JPEG contact sheets from every mounted card.
+- photos negatives: mirror kept contacts and fetch matching `.RAF` negatives
+- photos export:    collect the latest version of each negative for export
+- photos archive:   push negatives into the archive volume after editing
+- photos clean:     remove generated contacts, negatives, and export folders
+"""
+
+import argparse
+import os
+import re
+import shutil
+from typing import Callable, Generator, Optional
+
+
+VOLUMES_PATH = "/Volumes"
+CONTACTS_PATH = os.path.expanduser("~/Pictures/Contacts/")
+NEGATIVES_PATH = os.path.expanduser("~/Pictures/Negatives/")
+EXPORTS_PATH = os.path.expanduser("~/Pictures/Export/")
+ARCHIVE_PATH = os.path.join(VOLUMES_PATH, "meowfiles", "Photos")
+
+
+def is_raw(file: str) -> bool:
+    return file.lower().endswith(".raf")
+
+
+def is_image(file: str) -> bool:
+    return file.lower().endswith(".jpg") or file.lower().endswith(".jpeg")
+
+
+def get_photo_folders() -> Generator[str, None, None]:
+    for volume in os.listdir(VOLUMES_PATH):
+        dcim_path = os.path.join(VOLUMES_PATH, volume, "DCIM")
+
+        if not os.path.exists(dcim_path):
+            continue
+
+        for dirpath, dirnames, _ in os.walk(dcim_path):
+            for dirname in dirnames:
+                yield os.path.join(dirpath, dirname)
+
+
+def copy_files(
+    source: str, destination: str, fn: Optional[Callable] = None, verbose: bool = True
+) -> None:
+    if not os.path.exists(source):
+        return
+
+    for file in os.listdir(source):
+        if fn is not None and not fn(file):
+            continue
+
+        if file.startswith("."):
+            continue
+
+        src = os.path.join(source, file)
+        dst = os.path.join(destination, file)
+
+        if os.path.exists(dst):
+            pass
+
+        if verbose:
+            print(f"Copying {src}")
+
+        shutil.copyfile(src, dst)
+
+
+def copy_latest_version_files(
+    source: str,
+    destination: str,
+    fn: Optional[Callable] = None,
+    case_sensetive: bool = True,
+    verbose: bool = True,
+) -> None:
+    if not os.path.exists(destination):
+        os.makedirs(destination)
+
+    # Regex to extract base name and n from "name(n).ext"
+    pattern = re.compile(r"^(.*?)(\((\d+)\))?(\.[^.]+)$")
+
+    # Map: base_name + ext -> (n, filename)
+    latest_files = {}
+
+    for file in os.listdir(source):
+        if fn is not None and not fn(file):
+            continue
+
+        match = pattern.match(file)
+        if not match:
+            continue
+
+        base = match.group(1)
+        n = int(match.group(3)) if match.group(3) else 0
+        ext = match.group(4)
+
+        key = base + ext
+        if not case_sensetive:
+            key = key.lower()
+        if key not in latest_files or n > latest_files[key][0]:
+            latest_files[key] = (n, file)
+
+    for _, file in latest_files.values():
+        src = os.path.join(source, file)
+        dst = os.path.join(destination, file)
+
+        if verbose:
+            print(f"Copying {src}")
+
+        shutil.copyfile(src, dst)
+
+
+def contacts() -> None:
+    os.makedirs(CONTACTS_PATH, exist_ok=True)
+
+    for folder in get_photo_folders():
+        copy_files(folder, CONTACTS_PATH, is_image)
+
+
+def negatives() -> None:
+    os.makedirs(NEGATIVES_PATH, exist_ok=True)
+
+    print("Copying contacts...")
+    copy_files(CONTACTS_PATH, NEGATIVES_PATH, is_image, verbose=False)
+
+    files_folder = {}
+    for folder in get_photo_folders():
+        for file in os.listdir(folder):
+            files_folder[file] = folder
+
+    for root, _, files in os.walk(NEGATIVES_PATH):
+        for file in files:
+            if not is_image(file):
+                continue
+
+            if file.startswith("."):
+                continue
+
+            raf_file = os.path.splitext(file)[0] + ".RAF"
+            dst = os.path.join(root, raf_file)
+
+            if os.path.exists(dst):
+                print(f"Skipping {dst}: already exists")
+                continue
+
+            if raf_file not in files_folder:
+                print(f"Skipping {raf_file}: not found")
+                continue
+
+            src = os.path.join(files_folder[raf_file], raf_file)
+            print(f"Copying {src}")
+            shutil.copyfile(src, dst)
+
+
+def export() -> None:
+    os.makedirs(EXPORTS_PATH, exist_ok=True)
+    copy_latest_version_files(
+        NEGATIVES_PATH, EXPORTS_PATH, is_image, case_sensetive=False
+    )
+
+
+def ask_confirmation(prompt: str) -> bool:
+    response = input(prompt + " (y/N): ").strip().lower()
+
+    if response in ["y", "yes"]:
+        return True
+
+    return False
+
+
+def clean():
+    contacts_exist = os.path.exists(CONTACTS_PATH)
+    negatives_exist = os.path.exists(NEGATIVES_PATH)
+    export_exists = os.path.exists(EXPORTS_PATH)
+
+    if not contacts_exist and not negatives_exist and not export_exists:
+        print("Nothing to clean")
+        return
+
+    if not ask_confirmation(
+        "This will delete all contacts, negatives and exports, continue?"
+    ):
+        return
+
+    if contacts_exist:
+        print("Deleting contacts...")
+        shutil.rmtree(CONTACTS_PATH, ignore_errors=True)
+
+    if negatives_exist:
+        print("Deleting negatives...")
+        shutil.rmtree(NEGATIVES_PATH, ignore_errors=True)
+
+    if export_exists:
+        print("Deleting exports...")
+        shutil.rmtree(EXPORTS_PATH, ignore_errors=True)
+
+
+def archive():
+    for root, _, files in os.walk(NEGATIVES_PATH):
+        for file in files:
+            if file.startswith("."):
+                continue
+
+            src_path = os.path.join(root, file)
+            dst_dir = os.path.abspath(
+                os.path.join(ARCHIVE_PATH, os.path.relpath(root, NEGATIVES_PATH))
+            )
+            dst_path = os.path.join(dst_dir, file)
+
+            if os.path.exists(dst_path):
+                print(f"Skipping {dst_path}: already exists")
+                continue
+
+            os.makedirs(dst_dir, exist_ok=True)
+
+            print(f"Archiving {src_path}")
+            shutil.copy(src_path, dst_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Photo managing utility")
+    parser.add_argument(
+        "command",
+        choices=["contacts", "negatives", "export", "archive", "clean"],
+        help="Command to execute",
+    )
+    args = parser.parse_args()
+
+    match args.command:
+        case "contacts":
+            contacts()
+        case "negatives":
+            negatives()
+        case "export":
+            export()
+        case "archive":
+            archive()
+        case "clean":
+            clean()
+        case _:
+            raise NotImplementedError(f"Command {args.command} is not implemented")
+
+
+if __name__ == "__main__":
+    main()

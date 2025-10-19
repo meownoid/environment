@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import shutil
+import tempfile
+import unicodedata
+from dataclasses import dataclass
+from collections import defaultdict
+import uuid
+
+
+@dataclass(frozen=True)
+class Clipping:
+    title: str
+    location: int
+    date: str | None
+    content: str
+
+
+def clean(line):
+    line = line.strip()
+    line = line.replace("\ufeff", "")
+    line = unicodedata.normalize("NFC", line)
+
+    return line
+
+
+_location_date_regexp = re.compile(r".*location (\d+)-?\d*\s*\|\s*Added on (.+)")
+
+
+def parse_location_date(line: str) -> tuple[int, str | None]:
+    maybe_match = _location_date_regexp.match(line)
+    if maybe_match is None:
+        return -1, ""
+
+    return int(maybe_match[1]), maybe_match[2]
+
+
+def parse_clipping(lines: list[str]) -> Clipping | None:
+    if len(lines) < 3:
+        return None
+
+    title = lines[0]
+    loc, date = parse_location_date(lines[1])
+    content = "\n".join(lines[2:]).strip()
+
+    return Clipping(title, loc, date, content)
+
+
+def parse_clippings(lines: list[str]) -> list[Clipping]:
+    result = []
+
+    clipping_lines = []
+    for line in map(clean, lines):
+        if line == "==========":
+            if (clipping := parse_clipping(clipping_lines)) is not None:
+                result.append(clipping)
+            clipping_lines = []
+            continue
+        clipping_lines.append(line)
+
+    return result
+
+
+def make_quote(s: str) -> str:
+    return "\n".join(f"> {line}" for line in s.split("\n"))
+
+
+def write_markdown(output_dir: str, title: str, clippings: list[Clipping]) -> None:
+    output_path = os.path.join(output_dir, f"{title}.md")
+
+    print(f"Writing {output_path}")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(format_clippings(title, clippings))
+
+
+def write_rtf(output_dir: str, title: str, clippings: list[Clipping]) -> None:
+    output_path = os.path.join(output_dir, f"{title}.rtf")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_name = uuid.uuid4()
+        tmp_md_path = os.path.join(tmpdir, f"{tmp_name}.md")
+        tmp_rtf_path = os.path.join(tmpdir, f"{tmp_name}.rtf")
+
+        with open(tmp_md_path, "w", encoding="utf-8") as f:
+            f.write(format_clippings(title, clippings, rtf=True))
+
+        r = os.system(f"pandoc -s -o {tmp_rtf_path} {tmp_md_path}")
+        if r != 0 or not os.path.exists(tmp_rtf_path):
+            print(
+                "Failed to convert Markdown to RTF, make sure that pandoc is installed"
+            )
+            return
+
+        print(f"Writing {output_path}")
+        shutil.copyfile(tmp_rtf_path, output_path)
+
+
+def format_clippings(title: str, clippings: list[Clipping], rtf: bool = False) -> str:
+    result = [f"# {title}", ""]
+    for clipping in sorted(clippings, key=lambda c: c.location):
+        result.append(f"### Location {clipping.location}")
+        result.append("")
+        result.append(f"{make_quote(clipping.content)}")
+        result.append("")
+        if rtf:
+            result.append("```{=rtf}")
+            result.append("\page")
+            result.append("```")
+            result.append("")
+
+    return "\n".join(result).strip()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-i", "--input", type=str, default="/Volumes/Kindle/documents/My Clippings.txt"
+    )
+    parser.add_argument("-o", "--output", type=str, default=".")
+    parser.add_argument("-f", "--format", type=str, default="md")
+    args = parser.parse_args()
+
+    if args.format not in ["md", "rtf"]:
+        print(f"Unsupported format {args.format}, use 'md' or 'rtf'")
+        return
+
+    if not os.path.exists(args.input):
+        print(f"{args.input} does not exist")
+        return
+
+    if os.path.isfile(args.output):
+        print(f"{args.output} is not a directory")
+        return
+
+    print(f"Reading {args.input}")
+    with open(args.input, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    clippings_map = defaultdict(list)
+
+    for clipping in parse_clippings(lines):
+        if not clipping.content:
+            continue
+        clippings_map[clipping.title].append(clipping)
+
+    if not os.path.exists(args.output):
+        os.makedirs(args.output, exist_ok=True)
+
+    for title, cs in clippings_map.items():
+        if args.format == "rtf":
+            write_rtf(args.output, title, cs)
+        else:
+            write_markdown(args.output, title, cs)
+
+
+if __name__ == "__main__":
+    main()

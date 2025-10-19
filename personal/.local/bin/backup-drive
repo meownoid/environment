@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+
+# Usage: backup-drive <source-drive-name> [destination-drive-name]
+# Creates a backup of the source drive by running rsync against the destination
+# drive. If the destination drive name is omitted, the script defaults to
+# <source-drive-name>-backup.
+
+set -eu
+
+SOURCE_DRIVE_NAME="${1:-}"
+if [ -z "${SOURCE_DRIVE_NAME}" ]; then
+    echo "Usage: $(basename "$0") <source-drive-name> [destination-drive-name]" >&2
+    exit 64
+fi
+
+TARGET_DRIVE_NAME="${2:-${SOURCE_DRIVE_NAME}-backup}"
+
+SRC="/Volumes/${SOURCE_DRIVE_NAME}/"
+DST="/Volumes/${TARGET_DRIVE_NAME}/"
+
+if [ ! -d "${SRC}" ]; then
+    echo "Source ${SRC} is not mounted" >&2
+    exit 1
+fi
+
+if [ ! -d "${DST}" ]; then
+    echo "Destination ${DST} is not mounted" >&2
+    exit 1
+fi
+
+rsync -av \
+      --exclude '.Spotlight-V100' \
+      --exclude '.Trashes' \
+      --exclude '.DocumentRevisions-V100' \
+      --exclude '.TemporaryItems' \
+      --exclude '.fseventsd' \
+      --ignore-errors \
+      --progress \
+      --delete "$SRC" "$DST"
