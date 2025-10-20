@@ -12,14 +12,19 @@ import os
 import subprocess
 import tempfile
 
-SCALE_FILTERS = {
-    "1080": "scale=-2:1080",
-    "720": "scale=-2:720",
-    "4k": "scale=-2:2160",
+HEIGHTS = {
+    "2160": 2160,
+    "1440": 1440,
+    "1080": 1080,
+    "720": 720,
+    "4k": 2160,
+    "2k": 1440,
 }
 
 
-def transcode_for_apple(input_path, output_path, scale_filter):
+def transcode_for_apple(
+    input_path: str, output_path: str, height: int, threads: int | None = None
+) -> bool:
     # This is the ffmpeg command.
     # -i: input file
     # -c:v libx264: Use the H.264 video codec, which is widely supported.
@@ -44,14 +49,18 @@ def transcode_for_apple(input_path, output_path, scale_filter):
         "-profile:a",
         "aac_low",
         "-vf",
-        scale_filter,
+        f"scale=-2:{height}",
         "-pix_fmt",
         "yuv420p",
         "-movflags",
         "+faststart",
         "-y",
-        output_path,
     ]
+
+    if threads is not None:
+        command.extend(["-threads", str(threads)])
+
+    command.append(output_path)
 
     try:
         subprocess.run(command, check=True)
@@ -81,7 +90,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-r",
         "--resolution",
-        choices=tuple(SCALE_FILTERS.keys()),
+        choices=tuple(HEIGHTS.keys()),
         default="1080",
         help="Output resolution (default: 1080)",
     )
@@ -90,6 +99,12 @@ if __name__ == "__main__":
         "--force",
         action="store_true",
         help="Overwrite the output file if it already exists",
+    )
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        help="Number of threads to use for transcoding (default: ffmpeg decides)",
     )
 
     args = parser.parse_args()
@@ -114,23 +129,35 @@ if __name__ == "__main__":
             print(f"Output file '{output_file}' already exists. Skipping.")
             sys.exit(1)
 
+    if args.threads is not None and args.threads <= 0:
+        print("Error: '--threads' must be a positive integer.")
+        sys.exit(1)
+
     print(f"Transcoding '{input_file}'...")
 
     input_abs = os.path.abspath(input_file)
     output_abs = os.path.abspath(output_file)
 
+    height = HEIGHTS[args.resolution]
+
     if input_abs == output_abs:
         with tempfile.TemporaryDirectory() as tmp_dir:
             temp_output = os.path.join(tmp_dir, os.path.basename(output_file))
             success = transcode_for_apple(
-                input_file, temp_output, SCALE_FILTERS[args.resolution]
+                input_file,
+                temp_output,
+                height,
+                threads=args.threads,
             )
             if not success:
                 sys.exit(1)
             os.replace(temp_output, output_file)
     else:
         success = transcode_for_apple(
-            input_file, output_file, SCALE_FILTERS[args.resolution]
+            input_file,
+            output_file,
+            height,
+            threads=args.threads,
         )
         if not success:
             sys.exit(1)
