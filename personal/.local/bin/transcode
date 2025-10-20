@@ -10,6 +10,7 @@ import argparse
 import sys
 import os
 import subprocess
+import tempfile
 
 SCALE_FILTERS = {
     "1080": "scale=-2:1080",
@@ -54,13 +55,19 @@ def transcode_for_apple(input_path, output_path, scale_filter):
 
     try:
         subprocess.run(command, check=True)
-        print(f"Successfully transcoded to '{output_path}'")
+        return True
     except subprocess.CalledProcessError as e:
         print(f"Error during transcoding '{input_path}':")
-        print(e.stderr.decode())
+        if e.stderr:
+            try:
+                print(e.stderr.decode())
+            except AttributeError:
+                print(e.stderr)
+        return False
     except FileNotFoundError:
         print("Error: 'ffmpeg' command not found.")
         print("Please make sure ffmpeg is installed and in your system's PATH.")
+        return False
 
 
 if __name__ == "__main__":
@@ -108,4 +115,24 @@ if __name__ == "__main__":
             sys.exit(1)
 
     print(f"Transcoding '{input_file}'...")
-    transcode_for_apple(input_file, output_file, SCALE_FILTERS[args.resolution])
+
+    input_abs = os.path.abspath(input_file)
+    output_abs = os.path.abspath(output_file)
+
+    if input_abs == output_abs:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            temp_output = os.path.join(tmp_dir, os.path.basename(output_file))
+            success = transcode_for_apple(
+                input_file, temp_output, SCALE_FILTERS[args.resolution]
+            )
+            if not success:
+                sys.exit(1)
+            os.replace(temp_output, output_file)
+    else:
+        success = transcode_for_apple(
+            input_file, output_file, SCALE_FILTERS[args.resolution]
+        )
+        if not success:
+            sys.exit(1)
+
+    print(f"Successfully transcoded to '{output_file}'")
