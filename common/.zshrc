@@ -140,6 +140,10 @@ fi
 
 hash -d icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 
+if [ -d "$HOME/Library/Mobile Documents/iCloud~md~obsidian/" ]; then
+  hash -d obsidian="$HOME/Library/Mobile Documents/iCloud~md~obsidian/"
+fi
+
 ### Aliases ###
 
 alias ll="ls -1"
